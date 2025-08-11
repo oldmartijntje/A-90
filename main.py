@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Robust Screen Monitoring with ORB+Homography (Fixed Detection)
-- Detects up to 2 templates from ./images (transparent PNGs supported)
-- Alpha-blends PNGs onto white background when needed
-- Handles scale (±50%), rotation (±45°), mild distortion via homography
-- Overlay with random color per template; shows FPS in status bar
-- State: appears/disappears with 1s cooldown after disappearance
-- Debug: -d / --debug toggles verbose keypoint display; -s saves frame
+Robust Screen Monitoring with ORB+Homography
+- Detects every template PNG/JPG under ./images (including alpha PNGs)
+- Alpha-blends transparent templates onto white background
+- Robust detection with ORB (2000 features), Lowe's ratio, homography, and validation
+- Overlay with per-template color; prints FPS
+- State: appearances/disappearances with 1s cooldown
+- Debug with --debug; use keyboard for q/d/s as before
+- New: TK popup on confident recognition (2 seconds) with 2 buttons:
+  - Disable for 1 minute
+  - Quit app
+  - No button shortcuts
 """
 from __future__ import annotations
 
@@ -14,16 +18,19 @@ import argparse
 import threading
 import time
 import os
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import cv2
 import numpy as np
 import mss
+import tkinter as tk
+from tkinter import ttk
 
 # Global flags
 OVERLAY_ENABLED: bool = True
+PROGRAM_DISABLED_UNTIL: float = 0.0  # UTC timestamp until which processing is disabled
 
-# Detection thresholds and geometry
+# Detection thresholds
 MIN_INLIERS = 15
 RANSAC_REPROJ_TH = 3.0
 LOWE_RATIO = 0.75
@@ -33,7 +40,7 @@ AREA_MAX_RATIO = 2.0
 
 # Capture settings
 DOWNSCALE = 0.60  # 60% of original size
-TARGET_KEYPOINTS = 2000  # per-template ORB features
+TARGET_KEYPOINTS = 2000
 
 # Cooldown after disappearance (seconds)
 DISAPPEAR_COOLDOWN = 1.0
@@ -90,7 +97,7 @@ def alpha_to_white_composite(img: np.ndarray) -> np.ndarray:
     return out.astype(np.uint8)
 
 def load_templates(images_dir: str = "./images") -> List[TemplateData]:
-    """Load up to 2 templates from images_dir. Accepts PNG/JPG with optional alpha."""
+    """Load all template images from images_dir (no fixed limit). Supports PNG with alpha."""
     templates: List[TemplateData] = []
     if not os.path.isdir(images_dir):
         print(f"[Error] Templates folder not found: {images_dir}")
@@ -149,38 +156,66 @@ def valid_quad_area(quad: np.ndarray, template_area: float) -> bool:
 
 def save_frame_with_detections(frame: np.ndarray, tpl_list: List[TemplateData], prefix="frame") -> None:
     out = frame.copy()
-    for tpl in tpl_list:
-        cv2.putText(out, tpl.name, (10, 20 + 20 * tpl_list.index(tpl)),
+    for idx, tpl in enumerate(tpl_list):
+        cv2.putText(out, tpl.name, (10, 20 + 20 * idx),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, tpl.color, 2)
     ts = int(time.time())
-    out_path = f"{prefix}_{ts}.png"
-    cv2.imwrite(out_path, out)
-    print(f"[Info] Saved {out_path}")
+    cv2.imwrite(f"{prefix}_{ts}.png", out)
+    print(f"[Info] Saved {prefix}_{ts}.png")
 
-def draw_overlay(frame: np.ndarray, tpl: TemplateData, inliers: int, total_matches: int, H: Optional[np.ndarray]) -> None:
-    """Draw quad overlay and stats for a single template on the frame."""
-    if H is None:
-        return
-    quad = project_quad_from_homography(H)
-    if quad is None or quad.shape[0] != 4:
-        return
-    quad_int = quad.astype(int)
-    color = tpl.color
-    cv2.polylines(frame, [quad_int], isClosed=True, color=color, thickness=2)
+def show_popup(template_name: str) -> None:
+    """Show a transient Tkinter popup for 2 seconds with two buttons in a separate thread."""
+    def _popup():
+        root = tk.Tk()
+        root.title("Template Detected")
+        root.geometry("+100+100")
+        root.attributes("-topmost", True)
+        root.resizable(False, False)
 
-    conf = (inliers / total_matches) * 100.0 if total_matches > 0 else 0.0
-    text = f"{tpl.name}  {inliers}/{total_matches}  {conf:.1f}%"
-    cv2.putText(frame, text, (10, 20 + 20 *  tpl_list_index(tpl)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        # Make sure the window grabs focus and stays visible for ~2 seconds
+        try:
+            root.update_idletasks()
+            root.deiconify()
+            root.lift()
+            root.focus_force()
+        except Exception:
+            pass  # ignore if focus can't be forced
 
-def tpl_list_index(tpl: TemplateData) -> int:
-    """Helper to get index in global small list if needed; fallback 0."""
-    # In this script, we redraw with per-template info in order; simplest approach:
-    return 0
+        frame = ttk.Frame(root, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
 
-def compute_fps(start: float, count: int) -> float:
-    if count == 0:
-        return 0.0
-    return count / max(1e-6, time.time() - start)
+        msg = f"Detected: {template_name}"
+        label = ttk.Label(frame, text=msg, font=("Arial", 12, "bold"))
+        label.pack(pady=(0, 10))
+
+        # Buttons (no shortcuts)
+        btns = ttk.Frame(frame)
+        btns.pack()
+
+        def disable_for_min():
+            global PROGRAM_DISABLED_UNTIL
+            PROGRAM_DISABLED_UNTIL = time.time() + 60.0  # 60 seconds
+            root.destroy()
+
+        def quit_app():
+            global state
+            state.terminate = True
+            root.destroy()
+
+        b1 = ttk.Button(btns, text="Disable for 1 minute", command=disable_for_min)
+        b2 = ttk.Button(btns, text="Quit app", command=quit_app)
+        b1.pack(side=tk.LEFT, padx=5, pady=5)
+        b2.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # Disable all keyboard shortcuts by not binding any
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+
+        # Show for ~2 seconds
+        root.after(2000, root.destroy)
+        root.mainloop()
+
+    t = threading.Thread(target=_popup, daemon=True)
+    t.start()
 
 def capture_loop(state: SharedState) -> None:
     """Capture loop: create MSS instance in this thread and continuously grab screen frames."""
@@ -197,7 +232,7 @@ def capture_loop(state: SharedState) -> None:
                     if frame.shape[2] == 4:
                         frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
-                    # Downscale to 60%
+                    # Downscale
                     h, w = frame.shape[:2]
                     nw, nh = max(1, int(w * DOWNSCALE)), max(1, int(h * DOWNSCALE))
                     frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
@@ -217,11 +252,17 @@ def processing_loop(state: SharedState, templates: List[TemplateData], debug: bo
 
     template_infos = templates
 
-    # FPS timing
     fps_start = time.time()
     frames = 0
 
+    global PROGRAM_DISABLED_UNTIL
+
     while not state.terminate:
+        # Respect disable timer
+        if time.time() < PROGRAM_DISABLED_UNTIL:
+            time.sleep(0.1)
+            continue
+
         with state.lock:
             frame = state.frame.copy() if state.frame is not None else None
 
@@ -233,7 +274,6 @@ def processing_loop(state: SharedState, templates: List[TemplateData], debug: bo
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         overlay_frame = frame.copy() if OVERLAY_ENABLED else None
 
-        # Detect global keypoints in the frame to speed up per-template matching
         kp_frame, des_frame = orb_detector.detectAndCompute(gray, None)
 
         if des_frame is None or len(kp_frame) == 0:
@@ -259,7 +299,6 @@ def processing_loop(state: SharedState, templates: List[TemplateData], debug: bo
             if tpl.desc is None or not tpl.ready or len(tpl.kp) == 0:
                 continue
 
-            # KNN matching
             try:
                 raw_matches = bf.knnMatch(tpl.desc, des_frame, k=2)
             except Exception as e:
@@ -290,7 +329,6 @@ def processing_loop(state: SharedState, templates: List[TemplateData], debug: bo
                     inliers = 0
 
                 if H is not None and inliers >= MIN_INLIERS:
-                    # Project template corners to frame
                     quad = cv2.perspectiveTransform(
                         np.float32([[[0, 0]], [[tpl.w, 0]], [[tpl.w, tpl.h]], [[0, tpl.h]]]),
                         H
@@ -305,6 +343,7 @@ def processing_loop(state: SharedState, templates: List[TemplateData], debug: bo
                         if not tpl.is_visible:
                             tpl.is_visible = True
                             print(f"Template {tpl.name} appeared!")
+                            show_popup(tpl.name)  # transient popup on confident recognition
                         if OVERLAY_ENABLED:
                             quad_int = quad.astype(int)
                             cv2.polylines(frame, [quad_int], True, tpl.color, 2)
@@ -328,7 +367,6 @@ def processing_loop(state: SharedState, templates: List[TemplateData], debug: bo
                     tpl.cooldown_until = time.time() + DISAPPEAR_COOLDOWN
                     print(f"Template {tpl.name} disappeared (not enough matches)!")
 
-        # Show overlay window
         if overlay_frame is not None:
             if OVERLAY_ENABLED:
                 cv2.imshow("Monitor", frame)
@@ -347,27 +385,23 @@ def processing_loop(state: SharedState, templates: List[TemplateData], debug: bo
             fps_start = time.time()
             frames = 0
 
-        # Adaptive sleep to avoid busy loop (roughly cap processing to ~60-100 Hz)
         t1 = time.time()
         elapsed = t1 - t0
         if elapsed < 0.01:
             time.sleep(0.01)
 
 def main():
-    parser = argparse.ArgumentParser(description="Robust screen monitoring with ORB+Homography (template detection).")
+    parser = argparse.ArgumentParser(description="Robust screen monitoring with ORB+Homography.")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debugging output.")
     args = parser.parse_args()
 
-    # Load templates
     templates = load_templates("./images")
     if len(templates) == 0:
         print("[Error] No templates loaded. Exiting.")
         return
 
-    # Initialize state
     state.debug = args.debug
 
-    # Start threads
     t_cap = threading.Thread(target=capture_loop, args=(state,), daemon=True)
     t_proc = threading.Thread(target=processing_loop, args=(state, templates, state.debug), daemon=True)
 
@@ -377,9 +411,7 @@ def main():
     print("[Info] Monitoring started. Press 'q' to quit, 'd' for debug, 's' to save frame.")
     try:
         while not state.terminate:
-            # Display FPS in console occasionally
-            if state.fps > 0:
-                pass  # can print if needed
+            # Optional: print FPS or status
             time.sleep(0.1)
     except KeyboardInterrupt:
         state.terminate = True
