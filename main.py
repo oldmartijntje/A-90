@@ -210,8 +210,8 @@ def show_popup(template_name: str) -> None:
         # Disable all keyboard shortcuts by not binding any
         root.protocol("WM_DELETE_WINDOW", root.destroy)
 
-        # Show for ~2 seconds
-        root.after(2000, root.destroy)
+        # Show for ~4 seconds
+        root.after(4000, root.destroy)
         root.mainloop()
 
     t = threading.Thread(target=_popup, daemon=True)
